@@ -1,0 +1,317 @@
+from collections.abc import AsyncIterator, Callable, Iterator
+from pathlib import Path
+from typing import Any
+from unittest import mock
+
+import attr
+import scrapy
+from scrapy import Request, Spider
+from scrapy.http import Response, TextResponse
+from scrapy.settings import Settings
+from scrapy.utils.defer import deferred_f_from_coro_f
+from scrapy.utils.test import get_crawler
+from twisted.python.failure import Failure
+from web_poet import (
+    HttpClient,
+    HttpRequest,
+    HttpRequestBody,
+    HttpRequestHeaders,
+    HttpResponse,
+    RequestUrl,
+)
+from web_poet.serialization import SerializedLeafData, register_serialization
+
+from scrapy_poet import HttpResponseProvider
+from scrapy_poet.injection import Injector
+from scrapy_poet.page_input_providers import (
+    HttpClientProvider,
+    HttpRequestProvider,
+    PageObjectInputProvider,
+    PageParamsProvider,
+    ScrapyPoetStatCollector,
+    StatsProvider,
+)
+from scrapy_poet.utils.mockserver import get_ephemeral_port
+from scrapy_poet.utils.testing import HtmlResource, ProductHtml, crawl_single_item_async
+
+
+class NonProductHtml(HtmlResource):
+    html = """
+    <html>
+        <p>This one is clearly not a product</p>
+    </html>
+    """
+
+
+@attr.s(auto_attribs=True)
+class Price:
+    price: str
+
+
+@attr.s(auto_attribs=True)
+class Name:
+    name: str
+
+
+@attr.s(auto_attribs=True)
+class Html:
+    html: str
+
+
+class PriceHtmlDataProvider(PageObjectInputProvider):
+    name = "price_html"
+    provided_classes = {Price, Html}
+
+    def __init__(self, injector: Injector) -> None:
+        assert isinstance(injector, Injector)
+        super().__init__(injector)
+
+    def __call__(
+        self,
+        to_provide: set[Callable[..., Any]],
+        response: scrapy.http.Response,
+        spider: scrapy.Spider,
+    ) -> list[Any]:
+        assert isinstance(spider, scrapy.Spider)
+        ret: list[Any] = []
+        if Price in to_provide:
+            price = response.css(".price::text").get()
+            assert price is not None
+            ret.append(Price(price))
+        if Html in to_provide:
+            ret.append(Html("Price Html!"))
+        return ret
+
+
+class NameHtmlDataProvider(PageObjectInputProvider):
+    name = "name_html"
+    provided_classes = {Name, Html}.__contains__
+
+    def __call__(
+        self,
+        to_provide: set[Callable[..., Any]],
+        response: scrapy.http.Response,
+        settings: Settings,
+    ) -> list[Any]:
+        assert isinstance(settings, Settings)
+        ret: list[Any] = []
+        if Name in to_provide:
+            name = response.css(".name::text").get()
+            assert name is not None
+            ret.append(Name(name))
+        if Html in to_provide:
+            ret.append(Html("Name Html!"))
+        return ret
+
+
+class HttpResponseProviderForTest(HttpResponseProvider):
+    """Uses a fixed fingerprint because the test server is always changing the URL from test to test"""
+
+    def fingerprint(self, to_provide: set[Callable[..., Any]], request: Request) -> str:
+        return "http://example.com"
+
+
+for dep_cls in [Price, Name, Html]:
+    # all these types have the same structure so we can DRY
+    def _serialize(o: dep_cls) -> SerializedLeafData:  # type: ignore[valid-type]
+        return {"txt": attr.astuple(o)[0].encode()}
+
+    def _deserialize(cls: type[dep_cls], data: SerializedLeafData) -> dep_cls:  # type: ignore[valid-type]
+        return cls(data["txt"].decode())  # type: ignore[misc,no-any-return]
+
+    register_serialization(_serialize, _deserialize)
+
+
+class PriceFirstMultiProviderSpider(scrapy.Spider):
+    url: str
+    custom_settings = {
+        "SCRAPY_POET_PROVIDERS": {
+            HttpResponseProviderForTest: 0,
+            PriceHtmlDataProvider: 1,
+            NameHtmlDataProvider: 2,
+        }
+    }
+
+    def start_requests(self) -> Iterator[Request]:
+        yield Request(self.url, self.parse, errback=self.errback)
+
+    async def start(self) -> AsyncIterator[Any]:
+        for item_or_request in self.start_requests():
+            yield item_or_request
+
+    def errback(self, failure: Failure) -> Iterator[dict[str, Any]]:
+        yield {"exception": failure.value}
+
+    def parse(
+        self,
+        response: scrapy.http.Response,
+        price: Price,
+        name: Name,
+        html: Html,
+        response_data: HttpResponse,
+    ) -> Iterator[dict[Any, Any]]:
+        yield {
+            Price: price,
+            Name: name,
+            Html: html,
+            "response_data_text": response_data.text,
+        }
+
+
+class NameFirstMultiProviderSpider(PriceFirstMultiProviderSpider):
+    custom_settings = {
+        "SCRAPY_POET_PROVIDERS": {
+            HttpResponseProviderForTest: 0,
+            NameHtmlDataProvider: 1,
+            PriceHtmlDataProvider: 2,
+        }
+    }
+
+
+@deferred_f_from_coro_f
+async def test_name_first_spider(settings: dict[str, Any], tmp_path: Path) -> None:
+    port = get_ephemeral_port()
+    cache = tmp_path / "cache"
+    settings["SCRAPY_POET_CACHE"] = str(cache)
+    item, _, _ = await crawl_single_item_async(
+        NameFirstMultiProviderSpider, ProductHtml, settings, port=port
+    )
+    assert cache.exists()
+    assert item == {
+        Price: Price("22€"),
+        Name: Name("Chocolate"),
+        Html: Html("Name Html!"),
+        "response_data_text": ProductHtml.html,
+    }
+
+    # Let's see that the cache is working. We use a different and wrong resource,
+    # but it should be ignored by the cached version used
+    item, _, _ = await crawl_single_item_async(
+        NameFirstMultiProviderSpider, NonProductHtml, settings, port=port
+    )
+    assert item == {
+        Price: Price("22€"),
+        Name: Name("Chocolate"),
+        Html: Html("Name Html!"),
+        "response_data_text": ProductHtml.html,
+    }
+
+
+@deferred_f_from_coro_f
+async def test_price_first_spider(settings: dict[str, Any]) -> None:
+    item, _, _ = await crawl_single_item_async(
+        PriceFirstMultiProviderSpider, ProductHtml, settings
+    )
+    assert item == {
+        Price: Price("22€"),
+        Name: Name("Chocolate"),
+        Html: Html("Price Html!"),
+        "response_data_text": ProductHtml.html,
+    }
+
+
+@deferred_f_from_coro_f
+async def test_http_client_provider(settings: dict[str, Any]) -> None:
+    crawler = get_crawler(Spider, settings)
+    crawler.engine = mock.AsyncMock()
+    injector = Injector(crawler)
+
+    with mock.patch(
+        "scrapy_poet.page_input_providers._create_scrapy_downloader"
+    ) as mock_factory:
+        provider = HttpClientProvider(injector)
+        results = provider(set(), crawler)
+        assert isinstance(results[0], HttpClient)
+
+    assert results[0]._request_downloader == mock_factory.return_value
+
+
+@deferred_f_from_coro_f
+async def test_http_request_provider(settings: dict[str, Any]) -> None:
+    crawler = get_crawler(Spider, settings)
+    injector = Injector(crawler)
+    provider = HttpRequestProvider(injector)
+
+    empty_scrapy_request = scrapy.http.Request("https://example.com/")
+    (empty_request,) = provider(set(), empty_scrapy_request)
+    assert isinstance(empty_request, HttpRequest)
+    assert isinstance(empty_request.url, RequestUrl)
+    assert str(empty_request.url) == "https://example.com/"
+    assert empty_request.method == "GET"
+    assert isinstance(empty_request.headers, HttpRequestHeaders)
+    assert empty_request.headers == HttpRequestHeaders()
+    assert isinstance(empty_request.body, HttpRequestBody)
+    assert empty_request.body == HttpRequestBody()
+
+    full_scrapy_request = scrapy.http.Request(
+        "https://example.com/", method="POST", body=b"a", headers={"a": "b"}
+    )
+    (full_request,) = provider(set(), full_scrapy_request)
+    assert isinstance(full_request, HttpRequest)
+    assert isinstance(full_request.url, RequestUrl)
+    assert str(full_request.url) == "https://example.com/"
+    assert full_request.method == "POST"
+    assert isinstance(full_request.headers, HttpRequestHeaders)
+    assert full_request.headers == HttpRequestHeaders([("a", "b")])
+    assert isinstance(full_request.body, HttpRequestBody)
+    assert full_request.body == HttpRequestBody(b"a")
+
+
+def test_page_params_provider(settings: dict[str, Any]) -> None:
+    crawler = get_crawler(Spider, settings)
+    injector = Injector(crawler)
+    provider = PageParamsProvider(injector)
+    request = scrapy.http.Request("https://example.com")
+
+    results = provider(set(), request)
+
+    assert results[0] == {}
+
+    expected_data: dict[Any, str] = {"key": "value"}
+    request.meta.update({"page_params": expected_data})
+    results = provider(set(), request)
+
+    assert results[0] == expected_data
+
+    # Check that keys that are invalid Python variable names work.
+    expected_data = {1: "a"}
+    request.meta.update({"page_params": expected_data})
+    results = provider(set(), request)
+
+    assert results[0] == expected_data
+
+
+def test_stats_provider(settings: dict[str, Any]) -> None:
+    crawler = get_crawler(Spider, settings)
+    injector = Injector(crawler)
+    provider = StatsProvider(injector)
+
+    results = provider(set(), crawler)
+
+    stats = results[0]
+    assert isinstance(stats._stats, ScrapyPoetStatCollector)
+    assert stats._stats._stats == crawler.stats
+
+    stats.set("a", "1")
+    stats.set("b", 2)
+    stats.inc("b")
+    stats.inc("b", 5)
+    stats.inc("c")
+
+    expected = {"a": "1", "b": 8, "c": 1}
+    expected = {f"poet/stats/{k}": v for k, v in expected.items()}
+    actual = {k: v for k, v in crawler.stats._stats.items() if k in expected}
+    assert actual == expected
+
+
+def test_http_response_provider_encoding(settings: dict[str, Any]) -> None:
+    crawler = get_crawler(Spider, settings)
+    provider = HttpResponseProvider(Injector(crawler))
+    url = "https://example.com"
+    body = "<p>Привет</p>".encode("cp1251")
+
+    (response,) = provider(set(), TextResponse(url, body=body, encoding="cp1251"))
+    assert response.text == "<p>Привет</p>"
+
+    (response,) = provider(set(), Response(url, body=body))
+    assert response.body == body

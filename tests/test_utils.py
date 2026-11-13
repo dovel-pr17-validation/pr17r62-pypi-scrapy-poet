@@ -1,0 +1,348 @@
+from collections.abc import AsyncIterator, Iterator
+from pathlib import Path
+from typing import Any
+from unittest import mock
+from unittest.mock import MagicMock
+
+import pytest
+from scrapy import Spider
+from scrapy.http import Request, Response, TextResponse
+from scrapy.http.request import NO_CALLBACK
+from scrapy.settings import Settings
+from scrapy.utils.defer import deferred_f_from_coro_f, maybe_deferred_to_future
+from scrapy.utils.test import get_crawler
+from web_poet import HttpRequest, HttpResponse
+
+from scrapy_poet.utils import (
+    create_registry_instance,
+    get_scrapy_data_path,
+    http_request_to_scrapy_request,
+    http_response_to_scrapy_response,
+    scrapy_response_to_http_response,
+)
+from scrapy_poet.utils.testing import (
+    CollectorPipeline,
+    ProductHtml,
+    crawl_single_item,
+    make_crawler,
+)
+
+
+@mock.patch("scrapy_poet.utils.Path", autospec=True)
+@mock.patch("scrapy_poet.utils.inside_project")
+def test_get_scrapy_data_path(
+    mock_inside_project: MagicMock, mock_path: MagicMock, tmp_path: Path
+) -> None:
+    mock_inside_project.return_value = False
+
+    path = tmp_path / "test_dir"
+    result = get_scrapy_data_path(createdir=True, default_dir=str(path))
+
+    assert isinstance(result, str)
+    assert result  # should be non-empty
+
+    mock_inside_project.assert_called_once()
+
+    mock_path.assert_called_once_with(str(path))
+    mock_path_obj = mock_path.return_value
+    mock_path_obj.mkdir.assert_called_once_with(exist_ok=True, parents=True)
+
+
+@pytest.mark.parametrize(
+    ("http_request", "kwargs", "scrapy_request"),
+    [
+        (
+            HttpRequest("https://example.com"),
+            {},
+            Request("https://example.com", callback=NO_CALLBACK),
+        ),
+        (
+            HttpRequest("https://example.com"),
+            {"dont_filter": True},
+            Request("https://example.com", callback=NO_CALLBACK, dont_filter=True),
+        ),
+        (
+            HttpRequest("https://example.com", method="POST"),
+            {},
+            Request("https://example.com", callback=NO_CALLBACK, method="POST"),
+        ),
+        (
+            HttpRequest("https://example.com", headers={"a": "b"}),
+            {},
+            Request("https://example.com", callback=NO_CALLBACK, headers={"a": "b"}),
+        ),
+        (
+            HttpRequest("https://example.com", headers={"a": "b"}),
+            {},
+            Request("https://example.com", callback=NO_CALLBACK, headers=(("a", "b"),)),
+        ),
+        (
+            HttpRequest("https://example.com", headers=(("a", "b"),)),
+            {},
+            Request("https://example.com", callback=NO_CALLBACK, headers=(("a", "b"),)),
+        ),
+        (
+            HttpRequest(
+                "https://example.com",
+                headers=(("a", "b"), ("a", "c")),
+            ),
+            {},
+            Request(
+                "https://example.com",
+                callback=NO_CALLBACK,
+                headers=(("a", "b"), ("a", "c")),
+            ),
+        ),
+        (
+            HttpRequest("https://example.com", body=b"a"),
+            {},
+            Request("https://example.com", callback=NO_CALLBACK, body=b"a"),
+        ),
+    ],
+)
+def test_http_request_to_scrapy_request(
+    http_request: HttpRequest, kwargs: dict[str, Any], scrapy_request: Request
+) -> None:
+    result = http_request_to_scrapy_request(http_request, **kwargs)
+    assert result.url == scrapy_request.url
+    assert result.method == scrapy_request.method
+    assert result.headers == scrapy_request.headers
+    assert result.body == scrapy_request.body
+    assert result.meta == scrapy_request.meta
+    assert result.cb_kwargs == scrapy_request.cb_kwargs
+    assert result.cookies == scrapy_request.cookies
+    assert result.encoding == scrapy_request.encoding
+    assert result.priority == scrapy_request.priority
+    assert result.dont_filter == scrapy_request.dont_filter
+    assert result.callback == scrapy_request.callback
+    assert result.errback == scrapy_request.errback
+    assert result.flags == scrapy_request.flags
+
+
+@pytest.mark.parametrize(
+    ("scrapy_response", "http_response"),
+    [
+        (
+            Response("https://example.com"),
+            HttpResponse("https://example.com", body=b"", status=200),
+        ),
+        (
+            Response("https://example.com", body=b"a"),
+            HttpResponse("https://example.com", body=b"a", status=200),
+        ),
+        (
+            Response("https://example.com", status=429),
+            HttpResponse("https://example.com", body=b"", status=429),
+        ),
+        (
+            Response("https://example.com", headers={"a": "b"}),
+            HttpResponse(
+                "https://example.com",
+                body=b"",
+                status=200,
+                headers={"a": "b"},
+            ),
+        ),
+        (
+            Response("https://example.com", headers={"a": "b"}),
+            HttpResponse(
+                "https://example.com",
+                body=b"",
+                status=200,
+                headers=(("a", "b"),),
+            ),
+        ),
+        (
+            Response("https://example.com", headers=(("a", "b"),)),
+            HttpResponse(
+                "https://example.com",
+                body=b"",
+                status=200,
+                headers=(("a", "b"),),
+            ),
+        ),
+        pytest.param(
+            Response("https://example.com", headers=(("a", "b"), ("a", "c"))),
+            HttpResponse(
+                "https://example.com",
+                body=b"",
+                status=200,
+                headers=(("a", "b"), ("a", "c")),
+            ),
+            marks=pytest.mark.xfail(
+                reason="https://github.com/scrapy/scrapy/issues/5515",
+            ),
+        ),
+        (
+            TextResponse("https://example.com", body="a", encoding="ascii"),
+            HttpResponse(
+                "https://example.com", body=b"a", status=200, encoding="ascii"
+            ),
+        ),
+        (
+            TextResponse("https://example.com", body="a", encoding="utf-8"),
+            HttpResponse(
+                "https://example.com", body=b"a", status=200, encoding="utf-8"
+            ),
+        ),
+    ],
+)
+def test_scrapy_response_to_http_response(
+    scrapy_response: Response, http_response: HttpResponse
+) -> None:
+    result = scrapy_response_to_http_response(scrapy_response)
+    assert str(result.url) == str(http_response.url)
+    assert result.body == http_response.body
+    assert result.status == http_response.status
+    assert result.headers == http_response.headers
+    assert result._encoding == http_response._encoding
+
+
+@pytest.mark.parametrize(
+    ("scrapy_response", "http_response"),
+    [
+        (
+            Response("https://example.com"),
+            HttpResponse("https://example.com", body=b"", status=200),
+        ),
+        (
+            Response("https://example.com", body=b"a"),
+            HttpResponse("https://example.com", body=b"a", status=200),
+        ),
+        (
+            Response("https://example.com", status=429),
+            HttpResponse("https://example.com", body=b"", status=429),
+        ),
+        (
+            Response("https://example.com", headers={"a": "b"}),
+            HttpResponse(
+                "https://example.com",
+                body=b"",
+                status=200,
+                headers={"a": "b"},
+            ),
+        ),
+        (
+            Response("https://example.com", headers={"a": "b"}),
+            HttpResponse(
+                "https://example.com",
+                body=b"",
+                status=200,
+                headers=(("a", "b"),),
+            ),
+        ),
+        (
+            Response("https://example.com", headers=(("a", "b"),)),
+            HttpResponse(
+                "https://example.com",
+                body=b"",
+                status=200,
+                headers=(("a", "b"),),
+            ),
+        ),
+        pytest.param(
+            Response("https://example.com", headers=(("a", "b"), ("a", "c"))),
+            HttpResponse(
+                "https://example.com",
+                body=b"",
+                status=200,
+                headers=(("a", "b"), ("a", "c")),
+            ),
+            marks=pytest.mark.xfail(
+                reason="https://github.com/scrapy/scrapy/issues/5515",
+            ),
+        ),
+        (
+            TextResponse("https://example.com", body="a", encoding="ascii"),
+            HttpResponse(
+                "https://example.com", body=b"a", status=200, encoding="ascii"
+            ),
+        ),
+        (
+            TextResponse("https://example.com", body="a", encoding="utf-8"),
+            HttpResponse(
+                "https://example.com", body=b"a", status=200, encoding="utf-8"
+            ),
+        ),
+    ],
+)
+def test_http_response_to_scrapy_response(
+    scrapy_response: Response, http_response: HttpResponse
+) -> None:
+    result = http_response_to_scrapy_response(http_response)
+    assert str(result.url) == str(http_response.url)
+    assert result.body == scrapy_response.body
+    assert result.status == scrapy_response.status
+    assert result.headers == scrapy_response.headers
+    assert result._encoding == getattr(scrapy_response, "_encoding", "utf-8")
+
+
+@mock.patch("scrapy_poet.utils.consume_modules")
+def test_create_registry_instance_SCRAPY_POET_DISCOVER(
+    mock_consume_modules: MagicMock, settings: dict[str, Any]
+) -> None:
+    settings["SCRAPY_POET_RULES"] = []
+
+    mock_cls = mock.Mock()
+    fake_crawler = get_crawler(Spider, settings)
+    create_registry_instance(mock_cls, fake_crawler)
+    mock_consume_modules.assert_not_called()
+    mock_cls.assert_called_once_with(rules=[])
+
+    mock_cls = mock.Mock()
+    settings["SCRAPY_POET_DISCOVER"] = ["a.b.c", "x.y"]
+    fake_crawler = get_crawler(Spider, settings)
+    create_registry_instance(mock_cls, fake_crawler)
+    assert mock_consume_modules.call_args_list == [mock.call("a.b.c"), mock.call("x.y")]
+    mock_cls.assert_called_once_with(rules=[])
+
+
+def test_make_crawler_settings_object() -> None:
+    class TestSpider(Spider):
+        name = "test"
+
+    settings = Settings({"FOO": "bar"}, priority="spider")
+    crawler = make_crawler(TestSpider, settings)
+    assert crawler.settings["FOO"] == "bar"
+    assert crawler.settings.getpriority("FOO") == settings.getpriority("FOO")
+    assert CollectorPipeline in crawler.settings["ITEM_PIPELINES"]
+
+
+@deferred_f_from_coro_f
+async def test_crawl_single_item() -> None:
+    class ItemSpider(Spider):
+        name = "item"
+        url: str
+
+        def start_requests(self) -> Iterator[Request]:
+            yield Request(self.url)
+
+        async def start(self) -> AsyncIterator[Any]:
+            for request in self.start_requests():
+                yield request
+
+        def parse(self, response: Response) -> Iterator[dict[str, str]]:
+            yield {"url": response.url}
+
+    with (
+        pytest.warns(DeprecationWarning, match="crawl_items is deprecated"),
+        pytest.warns(DeprecationWarning, match="crawl_single_item is deprecated"),
+    ):
+        item, url, _ = await maybe_deferred_to_future(
+            crawl_single_item(ItemSpider, ProductHtml, {})
+        )
+    assert item == {"url": url}
+
+
+def test_is_min_scrapy_version_deprecated() -> None:
+    from scrapy_poet.utils import is_min_scrapy_version  # noqa: PLC0415
+
+    with pytest.warns(DeprecationWarning, match="is_min_scrapy_version"):
+        assert is_min_scrapy_version("2.0.0") is True
+
+
+def test_no_callback_deprecated() -> None:
+    from scrapy_poet import utils  # noqa: PLC0415
+
+    with pytest.warns(DeprecationWarning, match="NO_CALLBACK"):
+        assert utils.NO_CALLBACK is NO_CALLBACK

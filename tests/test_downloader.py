@@ -1,0 +1,708 @@
+from __future__ import annotations
+
+import logging
+from collections.abc import (  # noqa: TC003
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Iterator,
+    Sequence,
+)
+from functools import partial
+from importlib.metadata import version
+from typing import Any
+from unittest import mock
+from urllib.parse import urlparse
+
+import attr
+import pytest
+import scrapy
+import twisted
+import web_poet
+from packaging.version import parse as parse_version
+from scrapy import Request, Spider
+from scrapy.crawler import Crawler  # noqa: TC002
+from scrapy.exceptions import IgnoreRequest
+from scrapy.http import Response  # noqa: TC002
+from scrapy.http.request import NO_CALLBACK
+from scrapy.utils.defer import deferred_f_from_coro_f, maybe_deferred_to_future
+from web_poet import BrowserResponse, HttpClient
+from web_poet.exceptions import HttpError, HttpRequestError, HttpResponseError
+from web_poet.pages import WebPage
+
+from scrapy_poet import DummyResponse, PageObjectInputProvider
+from scrapy_poet.downloader import _create_scrapy_downloader
+from scrapy_poet.utils import http_request_to_scrapy_request
+from scrapy_poet.utils.mockserver import MockServer
+from scrapy_poet.utils.testing import (
+    DelayedResource,
+    EchoResource,
+    RedirectResource,
+    StatusResource,
+    _get_test_settings,
+    make_crawler,
+)
+
+
+@attr.define
+class AdditionalRequestsSuccessPage(WebPage[dict[str, Any]]):
+    http: HttpClient
+
+    async def to_item(self) -> dict[str, Any]:
+        response = await self.http.request(
+            self.response.url,
+            body=b"bar",
+        )
+        return {"foo": response.body.decode()}
+
+
+@attr.define
+class AdditionalRequestsRedirectPage(WebPage[dict[str, Any]]):
+    http: HttpClient
+
+    async def to_item(self) -> dict[str, Any]:
+        response = await self.http.get(self.response.urljoin("/redirect"))
+        return {"url": str(response.url)}
+
+
+@attr.define
+class AdditionalRequestsBadResponsePage(WebPage[dict[str, Any] | None]):
+    http: HttpClient
+
+    async def to_item(self) -> dict[str, Any] | None:
+        try:
+            await self.http.request(
+                self.response.url,
+                body=b"400",
+            )
+        except HttpResponseError:
+            return {"foo": "bar"}
+        return None
+
+
+@attr.define
+class AdditionalRequestsConnectionIssuePage(WebPage[dict[str, Any] | None]):
+    http: HttpClient
+
+    async def to_item(self) -> dict[str, Any] | None:
+        try:
+            await self.http.request(
+                self.response.url,
+                body=b"0.002",
+            )
+        except HttpRequestError:
+            return {"foo": "bar"}
+        return None
+
+
+@attr.define
+class AdditionalRequestsIgnoredRequestPage(WebPage[dict[str, Any] | None]):
+    http: HttpClient
+
+    async def to_item(self) -> dict[str, Any] | None:
+        try:
+            await self.http.request(
+                self.response.url,
+                body=b"ignore",
+            )
+        except HttpError as e:
+            return {"exc": e.__class__}
+        return None
+
+
+@attr.define
+class AdditionalRequestsDontFilterDuplicatePage(WebPage[dict[str, Any]]):
+    http: HttpClient
+
+    async def to_item(self) -> dict[str, Any]:
+        response1 = await self.http.request(
+            self.response.url,
+            body=b"a",
+        )
+        response2 = await self.http.request(
+            self.response.url,
+            body=b"a",
+        )
+        return {response1.body.decode(): response2.body.decode()}
+
+
+@attr.define
+class AdditionalRequestsDontFilterOffsitePage(WebPage[dict[str, Any]]):
+    http: HttpClient
+
+    async def to_item(self) -> dict[str, Any]:
+        response1 = await self.http.request(
+            self.response.url,
+            body=b"a",
+        )
+        # Not filtered out by the offsite middleware because it is an
+        # additional request.
+        response2 = await self.http.request("data:,b")
+        return {response1.body.decode(): response2.body.decode()}
+
+
+@attr.define
+class AdditionalRequestsNoCbDepsPage(WebPage[dict[str, Any]]):
+    browser_response: BrowserResponse
+    http: HttpClient
+
+    async def to_item(self) -> dict[str, Any]:
+        additional_response = await self.http.request(
+            self.response.url,
+            body=b"a",
+        )
+        return {
+            "main": str(self.browser_response.html),
+            "additional": additional_response.body.decode(),
+        }
+
+
+@attr.define
+class AdditionalRequestsUnhandledDownloaderMiddlewareExceptionPage(
+    WebPage[dict[str, Any] | None]
+):
+    http: HttpClient
+
+    async def to_item(self) -> dict[str, Any] | None:
+        try:
+            await self.http.request(
+                self.response.url,
+                body=b"raise",
+            )
+        except HttpError as e:
+            return {"exc": e.__class__}
+        return None
+
+
+@pytest.fixture
+def scrapy_downloader() -> Callable[
+    [web_poet.HttpRequest], Awaitable[web_poet.HttpResponse]
+]:
+    mock_downloader = mock.AsyncMock()
+    return _create_scrapy_downloader(mock_downloader)
+
+
+@deferred_f_from_coro_f
+async def test_incompatible_scrapy_request(
+    scrapy_downloader: Callable[
+        [web_poet.HttpRequest], Awaitable[web_poet.HttpResponse]
+    ],
+) -> None:
+    """The Request must be web_poet.HttpRequest and not anything else."""
+
+    req = scrapy.Request("https://example.com")
+
+    with pytest.raises(TypeError):
+        await scrapy_downloader(req)  # type: ignore[arg-type]
+
+
+@pytest.fixture
+def fake_http_response() -> web_poet.HttpResponse:
+    return web_poet.HttpResponse(
+        "https://example.com",
+        b"some content",
+        status=200,
+        headers={"Content-Type": "text/html; charset=utf-8"},
+    )
+
+
+@deferred_f_from_coro_f
+async def test_scrapy_poet_downloader(
+    fake_http_response: web_poet.HttpResponse,
+) -> None:
+    req = web_poet.HttpRequest("https://example.com")
+
+    mock_downloader = mock.AsyncMock(return_value=fake_http_response)
+    scrapy_downloader = _create_scrapy_downloader(mock_downloader)
+    response = await scrapy_downloader(req)
+    assert isinstance(response, web_poet.HttpResponse)
+
+    assert str(response.url) == "https://example.com"
+    assert response.text == "some content"
+    assert response.status == 200
+    assert response.headers.get("Content-Type") == "text/html; charset=utf-8"
+    assert len(response.headers) == 1
+
+
+@deferred_f_from_coro_f
+async def test_scrapy_poet_downloader_ignored_request() -> None:
+    """It should handle IgnoreRequest from Scrapy according to the web poet
+    standard on additional request error handling."""
+    req = web_poet.HttpRequest("https://example.com")
+
+    mock_downloader = mock.AsyncMock(side_effect=scrapy.exceptions.IgnoreRequest)
+    scrapy_downloader = _create_scrapy_downloader(mock_downloader)
+
+    with pytest.raises(web_poet.exceptions.HttpError):
+        await scrapy_downloader(req)
+
+
+@deferred_f_from_coro_f
+async def test_scrapy_poet_downloader_twisted_error() -> None:
+    req = web_poet.HttpRequest("https://example.com")
+
+    mock_downloader = mock.AsyncMock(side_effect=twisted.internet.error.TimeoutError)
+    scrapy_downloader = _create_scrapy_downloader(mock_downloader)
+
+    with pytest.raises(web_poet.exceptions.HttpRequestError):
+        await scrapy_downloader(req)
+
+
+@deferred_f_from_coro_f
+async def test_scrapy_poet_downloader_head_redirect(
+    fake_http_response: web_poet.HttpResponse,
+) -> None:
+    req = web_poet.HttpRequest("https://example.com", method="HEAD")
+
+    mock_downloader = mock.AsyncMock(return_value=fake_http_response)
+    scrapy_downloader = _create_scrapy_downloader(mock_downloader)
+
+    await scrapy_downloader(req)
+
+    args, _ = mock_downloader.call_args
+    scrapy_request = args[0]
+    assert scrapy_request.meta.get("dont_redirect") is True
+
+
+@deferred_f_from_coro_f
+async def test_additional_requests_success() -> None:
+    items = []
+
+    with MockServer(EchoResource) as server:
+
+        class TestSpider(Spider):
+            name = "test_spider"
+
+            def start_requests(self) -> Iterator[Request]:
+                yield Request(server.root_url, callback=self.parse)
+
+            async def start(self) -> AsyncIterator[Any]:
+                for item_or_request in self.start_requests():
+                    yield item_or_request
+
+            async def parse(
+                self, response: Response, page: AdditionalRequestsSuccessPage
+            ) -> None:
+                item = await page.to_item()
+                items.append(item)
+
+        crawler = make_crawler(TestSpider)
+        await maybe_deferred_to_future(crawler.crawl())
+
+    assert items == [{"foo": "bar"}]
+
+
+@deferred_f_from_coro_f
+async def test_response_redirect() -> None:
+    urls = []
+
+    with MockServer(RedirectResource) as server:
+
+        class TestSpider(Spider):
+            name = "test_spider"
+
+            def start_requests(self) -> Iterator[Request]:
+                yield Request(f"{server.root_url}redirect", callback=self.parse)
+
+            async def start(self) -> AsyncIterator[Any]:
+                for item_or_request in self.start_requests():
+                    yield item_or_request
+
+            async def parse(self, response: Response, page: WebPage) -> None:  # type: ignore[type-arg]
+                urls.append(str(page.response.url))
+
+        crawler = make_crawler(TestSpider)
+        await maybe_deferred_to_future(crawler.crawl())
+
+    assert urls == [f"{server.root_url}target"]
+
+
+@deferred_f_from_coro_f
+async def test_additional_requests_redirect() -> None:
+    items = []
+
+    with MockServer(RedirectResource) as server:
+
+        class TestSpider(Spider):
+            name = "test_spider"
+
+            def start_requests(self) -> Iterator[Request]:
+                yield Request(server.root_url, callback=self.parse)
+
+            async def start(self) -> AsyncIterator[Any]:
+                for item_or_request in self.start_requests():
+                    yield item_or_request
+
+            async def parse(
+                self, response: Response, page: AdditionalRequestsRedirectPage
+            ) -> None:
+                item = await page.to_item()
+                items.append(item)
+
+        crawler = make_crawler(TestSpider)
+        await maybe_deferred_to_future(crawler.crawl())
+
+    assert items == [{"url": f"{server.root_url}target"}]
+
+
+@deferred_f_from_coro_f
+async def test_additional_requests_bad_response() -> None:
+    items = []
+
+    with MockServer(StatusResource) as server:
+
+        class TestSpider(Spider):
+            name = "test_spider"
+
+            def start_requests(self) -> Iterator[Request]:
+                yield Request(server.root_url, callback=self.parse)
+
+            async def start(self) -> AsyncIterator[Any]:
+                for item_or_request in self.start_requests():
+                    yield item_or_request
+
+            async def parse(
+                self, response: Response, page: AdditionalRequestsBadResponsePage
+            ) -> None:
+                item = await page.to_item()
+                items.append(item)
+
+        crawler = make_crawler(TestSpider)
+        await maybe_deferred_to_future(crawler.crawl())
+
+    assert items == [{"foo": "bar"}]
+
+
+@deferred_f_from_coro_f
+async def test_additional_requests_connection_issue() -> None:
+    items = []
+
+    with mock.patch(
+        "scrapy_poet.downloader.http_request_to_scrapy_request"
+    ) as mock_http_request_to_scrapy_request:
+        mock_http_request_to_scrapy_request.side_effect = partial(
+            http_request_to_scrapy_request,
+            meta={"download_timeout": 0.001},
+        )
+
+        with MockServer(DelayedResource) as server:
+
+            class TestSpider(Spider):
+                name = "test_spider"
+
+                def start_requests(self) -> Iterator[Request]:
+                    yield Request(server.root_url, callback=self.parse)
+
+                async def start(self) -> AsyncIterator[Any]:
+                    for item_or_request in self.start_requests():
+                        yield item_or_request
+
+                async def parse(
+                    self,
+                    response: Response,
+                    page: AdditionalRequestsConnectionIssuePage,
+                ) -> None:
+                    item = await page.to_item()
+                    items.append(item)
+
+            crawler = make_crawler(TestSpider)
+            await maybe_deferred_to_future(crawler.crawl())
+
+    assert items == [{"foo": "bar"}]
+
+
+@deferred_f_from_coro_f
+async def test_additional_requests_ignored_request() -> None:
+    items = []
+
+    with MockServer(EchoResource) as server:
+
+        class TestDownloaderMiddleware:
+            def process_response(
+                self, request: Request, response: Response, spider: Spider | None = None
+            ) -> Response:
+                if b"ignore" in response.body:
+                    raise IgnoreRequest
+                return response
+
+        class TestSpider(Spider):
+            name = "test_spider"
+
+            def start_requests(self) -> Iterator[Request]:
+                yield Request(server.root_url, callback=self.parse)
+
+            async def start(self) -> AsyncIterator[Any]:
+                for item_or_request in self.start_requests():
+                    yield item_or_request
+
+            async def parse(
+                self, response: Response, page: AdditionalRequestsIgnoredRequestPage
+            ) -> None:
+                item = await page.to_item()
+                items.append(item)
+
+        settings = _get_test_settings()
+        settings["DOWNLOADER_MIDDLEWARES"][TestDownloaderMiddleware] = 1
+        crawler = make_crawler(TestSpider, settings)
+        await maybe_deferred_to_future(crawler.crawl())
+
+    assert items == [{"exc": HttpError}]
+
+
+if parse_version(version("Twisted")) >= parse_version("24.7.0"):
+    _twisted_24_7_0_plus_xfail = pytest.mark.xfail(
+        reason=(
+            "Currently, we do not make a distinction between exceptions "
+            "raised from the downloader or from a downloader middleware, "
+            "except for IgnoreRequest. In the future, we might want to "
+            "inspect the stack to determine the source of an exception and "
+            "raise HttpError instead of HttpRequestError when the exception "
+            "originates in a downloader middleware."
+        ),
+        strict=True,
+    )
+else:
+
+    def _twisted_24_7_0_plus_xfail(f: Callable[..., Any]) -> Callable[..., Any]:  # type: ignore[misc]
+        return f
+
+
+@_twisted_24_7_0_plus_xfail
+async def test_additional_requests_unhandled_downloader_middleware_exception() -> None:
+    items = []
+
+    with MockServer(EchoResource) as server:
+
+        class TestDownloaderMiddleware:
+            def process_response(
+                self, request: Request, response: Response, spider: Spider | None = None
+            ) -> Response:
+                if b"raise" in response.body:
+                    raise RuntimeError
+                return response
+
+        class TestSpider(Spider):
+            name = "test_spider"
+
+            def start_requests(self) -> Iterator[Request]:
+                yield Request(server.root_url, callback=self.parse)
+
+            async def start(self) -> AsyncIterator[Any]:
+                for item_or_request in self.start_requests():
+                    yield item_or_request
+
+            async def parse(
+                self,
+                response: Response,
+                page: AdditionalRequestsUnhandledDownloaderMiddlewareExceptionPage,
+            ) -> None:
+                item = await page.to_item()
+                items.append(item)
+
+        settings = _get_test_settings()
+        settings["DOWNLOADER_MIDDLEWARES"][TestDownloaderMiddleware] = 1
+        settings["RETRY_ENABLED"] = False
+        crawler = make_crawler(TestSpider, settings=settings)
+        await maybe_deferred_to_future(crawler.crawl())
+
+    assert items == [{"exc": HttpError}]
+
+
+@deferred_f_from_coro_f
+async def test_additional_requests_dont_filter_duplicate() -> None:
+    """Verify that while duplicate regular requests are filtered out,
+    additional requests are not (neither relative to the main requests not
+    relative to each other).
+
+    In Scrapy, request de-duplication is implemented on the scheduler, and
+    because additional requests do not go through the scheduler, this works as
+    expected.
+    """
+    items = []
+
+    with MockServer(EchoResource) as server:
+
+        class TestSpider(Spider):
+            name = "test_spider"
+
+            def start_requests(self) -> Iterator[Request]:
+                yield Request(server.root_url, body=b"a", callback=self.parse)
+                yield Request(server.root_url, body=b"a", callback=self.parse)
+
+            async def start(self) -> AsyncIterator[Any]:
+                for item_or_request in self.start_requests():
+                    yield item_or_request
+
+            async def parse(
+                self,
+                response: Response,
+                page: AdditionalRequestsDontFilterDuplicatePage,
+            ) -> None:
+                item = await page.to_item()
+                items.append(item)
+
+        crawler = make_crawler(TestSpider)
+        await maybe_deferred_to_future(crawler.crawl())
+
+    assert items == [{"a": "a"}]
+
+
+@deferred_f_from_coro_f
+async def test_additional_requests_dont_filter_offsite() -> None:
+    pytest.importorskip("scrapy.downloadermiddlewares.offsite")
+
+    items = []
+
+    with MockServer(EchoResource) as server:
+
+        class TestSpider(Spider):
+            name = "test_spider"
+            allowed_domains = [str(urlparse(server.root_url).hostname)]
+
+            def start_requests(self) -> Iterator[Request]:
+                yield Request(server.root_url, callback=self.parse)
+                # Filtered out by the offsite middleware:
+                yield Request("data:,", callback=self.parse)
+
+            async def start(self) -> AsyncIterator[Any]:
+                for item_or_request in self.start_requests():
+                    yield item_or_request
+
+            async def parse(
+                self, response: Response, page: AdditionalRequestsDontFilterOffsitePage
+            ) -> None:
+                item = await page.to_item()
+                items.append(item)
+
+        crawler = make_crawler(TestSpider)
+        await maybe_deferred_to_future(crawler.crawl())
+
+    assert items == [{"a": "b"}]
+
+
+@deferred_f_from_coro_f
+async def test_additional_requests_no_cb_deps() -> None:
+    # https://github.com/scrapy-plugins/scrapy-zyte-api/issues/135
+    # This tests that the additional request doesn't go through dep resolving
+    # like if it used self.parse as a callback.
+
+    items = []
+    provider_calls = 0
+
+    class BrowserResponseProvider(PageObjectInputProvider):
+        provided_classes = {BrowserResponse}
+
+        async def __call__(
+            self,
+            to_provide: set[Callable[..., Any]],
+            request: Request,
+            crawler: Crawler,
+        ) -> Sequence[Any]:
+            nonlocal provider_calls
+            provider_calls += 1
+            custom_request = Request(
+                request.url, body=request.body, callback=NO_CALLBACK
+            )
+            assert crawler.engine
+            scrapy_response: Response
+            if hasattr(crawler.engine, "download_async"):
+                # Scrapy 2.14+
+                scrapy_response = await crawler.engine.download_async(custom_request)
+            else:
+                scrapy_response = await maybe_deferred_to_future(
+                    crawler.engine.download(custom_request)
+                )
+            result = BrowserResponse(
+                url=scrapy_response.url,
+                html=scrapy_response.text,
+                status=scrapy_response.status,
+            )
+            return [result]
+
+    with MockServer(EchoResource) as server:
+
+        class TestSpider(Spider):
+            name = "test_spider"
+
+            custom_settings = {
+                "SCRAPY_POET_PROVIDERS": {
+                    BrowserResponseProvider: 1100,
+                },
+            }
+
+            def start_requests(self) -> Iterator[Request]:
+                yield Request(server.root_url, callback=self.parse)  # type: ignore[arg-type]
+
+            async def start(self) -> AsyncIterator[Any]:
+                for item_or_request in self.start_requests():
+                    yield item_or_request
+
+            async def parse(  # type: ignore[override]
+                self, response: DummyResponse, page: AdditionalRequestsNoCbDepsPage
+            ) -> None:
+                item = await page.to_item()
+                items.append(item)
+
+        crawler = make_crawler(TestSpider)
+        await maybe_deferred_to_future(crawler.crawl())
+
+    assert provider_calls == 1
+    assert items == [{"main": "", "additional": "a"}]
+
+
+@attr.define
+class BasicPage(WebPage[dict[str, str]]):
+    def to_item(self) -> dict[str, str]:  # type: ignore[override]
+        return {"key": "value"}
+
+
+class BaseSpider(Spider):
+    name = "test_spider"
+
+
+@deferred_f_from_coro_f
+async def test_parse_callback_NO_CALLBACK(caplog: pytest.LogCaptureFixture) -> None:
+    """See: https://github.com/scrapinghub/scrapy-poet/issues/118"""
+
+    collected = {}
+
+    with MockServer(EchoResource) as server:
+
+        class TestSpider(BaseSpider):
+            start_urls = [server.root_url]
+
+            def parse(self, response: DummyResponse) -> None:  # type: ignore[override]
+                collected["response"] = response
+
+        crawler = make_crawler(TestSpider)
+        await maybe_deferred_to_future(crawler.crawl())
+
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert isinstance(collected["response"], DummyResponse)
+
+
+@deferred_f_from_coro_f
+async def test_parse_callback_NO_CALLBACK_with_page_dep(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """See: https://github.com/scrapinghub/scrapy-poet/issues/118
+
+    Similar to ``test_parse_callback_NO_CALLBACK()`` but with a page object
+    dependency in ``parse()`` callback.
+    """
+
+    collected = {}
+
+    with MockServer(EchoResource) as server:
+
+        class TestSpider(BaseSpider):
+            start_urls = [server.root_url]
+
+            def parse(self, response: DummyResponse, page: BasicPage) -> None:  # type: ignore[override]
+                collected["response"] = response
+
+        crawler = make_crawler(TestSpider)
+        await maybe_deferred_to_future(crawler.crawl())
+
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert not isinstance(collected["response"], DummyResponse)

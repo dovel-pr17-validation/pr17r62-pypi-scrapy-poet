@@ -1,0 +1,30 @@
+# Python
+*.pyc
+*.pyo
+/build/
+/dist/
+*.egg-info
+
+# Mac OS
+*.DS_Store
+
+# IDE
+/.idea/
+/.vscode/
+
+.mypy_cache/
+.cache/
+.tox/
+.pytest_cache/
+.coverage*
+_build/
+_static/
+_templates/
+htmlcov/
+coverage.xml
+
+# virtual env
+venv*/
+env*/
+.venv*/
+.env*/
